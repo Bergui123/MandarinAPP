@@ -1,4 +1,3 @@
-import * as Speech from 'expo-speech';
 import { useMemo } from 'react';
 import { FlatList, Platform, Pressable, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -9,11 +8,7 @@ import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { CHARACTERS_BY_ID } from '@/data/characters';
 import { useAppState } from '@/hooks/use-app-state';
 import { DailyCounts, LearnedChar, daysBetween, targetReps, todayKey } from '@/lib/progress';
-
-function speak(hanzi: string) {
-  Speech.stop();
-  Speech.speak(hanzi, { language: 'zh-CN' });
-}
+import { speak } from '@/lib/speech';
 
 function CharacterRow({
   learned,
