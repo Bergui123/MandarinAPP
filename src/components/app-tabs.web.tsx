@@ -25,6 +25,9 @@ export default function AppTabs() {
           <TabTrigger name="quiz" href="/quiz" asChild>
             <TabButton>Quiz</TabButton>
           </TabTrigger>
+          <TabTrigger name="talk" href="/talk" asChild>
+            <TabButton>Talk</TabButton>
+          </TabTrigger>
         </CustomTabList>
       </TabList>
     </Tabs>
