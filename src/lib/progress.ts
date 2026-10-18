@@ -1,13 +1,69 @@
-import { CHARACTERS } from '@/data/characters';
+import { CHARACTERS, CHARACTERS_BY_ID } from '@/data/characters';
 
-export type LearnedChar = { id: number; dateAdded: string };
+export type LearnedChar = {
+  id: number;
+  dateAdded: string;
+  notes?: string;
+  hanzi?: string;
+  pinyin?: string;
+  meaning?: string;
+};
 export type DailyCounts = { write: number; speak: number };
 export type AppState = {
   learned: LearnedChar[];
   dailyCounts: Record<string, Record<string, DailyCounts>>;
+  talkMemory: string;
 };
 
-export const EMPTY_STATE: AppState = { learned: [], dailyCounts: {} };
+export const EMPTY_STATE: AppState = { learned: [], dailyCounts: {}, talkMemory: '' };
+
+const CONVERSATION_ID_START = 10_000_000;
+
+// Conversation-sourced words carry their own hanzi/pinyin/meaning; static-dataset
+// words look them up by id. Never throws — a corrupted/old record degrades visibly.
+export function resolveCharacterDisplay(learned: LearnedChar): { hanzi: string; pinyin: string; meaning: string } {
+  if (learned.hanzi !== undefined) {
+    return { hanzi: learned.hanzi, pinyin: learned.pinyin ?? '', meaning: learned.meaning ?? '' };
+  }
+  const entry = CHARACTERS_BY_ID.get(learned.id);
+  if (entry) return { hanzi: entry.hanzi, pinyin: entry.pinyin, meaning: entry.meaning };
+  return { hanzi: '?', pinyin: '', meaning: '(unknown)' };
+}
+
+export function isHanziTracked(state: AppState, hanzi: string): boolean {
+  return state.learned.some((c) => resolveCharacterDisplay(c).hanzi === hanzi);
+}
+
+// A word DeepSeek introduces in conversation joins the same tracked list Practice
+// reads from. Deduped by hanzi; ids start well above the static dataset's range.
+export function addConversationWord(
+  state: AppState,
+  word: { hanzi: string; pinyin: string; meaning: string },
+  today: string = todayKey()
+): AppState {
+  if (isHanziTracked(state, word.hanzi)) return state;
+
+  const usedIds = new Set(state.learned.map((c) => c.id));
+  let id = CONVERSATION_ID_START;
+  while (usedIds.has(id)) id++;
+
+  return {
+    ...state,
+    learned: [...state.learned, { id, dateAdded: today, hanzi: word.hanzi, pinyin: word.pinyin, meaning: word.meaning }],
+  };
+}
+
+// Replaces (not appends) the note — a current read on proficiency, not a log.
+export function updateNotes(state: AppState, id: number, notes: string): AppState {
+  return {
+    ...state,
+    learned: state.learned.map((c) => (c.id === id ? { ...c, notes } : c)),
+  };
+}
+
+export function updateTalkMemory(state: AppState, memory: string): AppState {
+  return { ...state, talkMemory: memory };
+}
 
 export function todayKey(date: Date = new Date()): string {
   const y = date.getFullYear();
