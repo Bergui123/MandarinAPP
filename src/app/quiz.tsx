@@ -5,8 +5,13 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
-import { CHARACTERS_BY_ID } from '@/data/characters';
 import { useAppState } from '@/hooks/use-app-state';
+import { resolveCharacterDisplay } from '@/lib/progress';
+
+// Scales down for multi-character words so they still fit the card.
+function hanziFontSize(length: number): number {
+  return length > 1 ? Math.max(48, 96 - (length - 1) * 16) : 96;
+}
 
 function shuffled(ids: number[]): number[] {
   const copy = [...ids];
@@ -79,7 +84,8 @@ export default function QuizScreen() {
     );
   }
 
-  const char = CHARACTERS_BY_ID.get(sessionIds[index])!;
+  const learnedEntry = state.learned.find((c) => c.id === sessionIds[index])!;
+  const char = resolveCharacterDisplay(learnedEntry);
 
   return (
     <ThemedView style={styles.container}>
@@ -90,7 +96,9 @@ export default function QuizScreen() {
 
         <Pressable style={styles.cardPressable} onPress={() => setFlipped((f) => !f)}>
           <ThemedView type="backgroundElement" style={styles.card}>
-            <ThemedText style={styles.hanzi}>{char.hanzi}</ThemedText>
+            <ThemedText style={[styles.hanzi, { fontSize: hanziFontSize(char.hanzi.length) }]}>
+              {char.hanzi}
+            </ThemedText>
             <ThemedText themeColor="textSecondary">{char.pinyin}</ThemedText>
             {flipped ? (
               <ThemedText type="subtitle" style={styles.meaning}>
@@ -109,7 +117,7 @@ export default function QuizScreen() {
             <Pressable
               style={styles.answerButton}
               onPress={() => {
-                markMissed(char.id);
+                markMissed(learnedEntry.id);
                 next();
               }}>
               <ThemedView type="backgroundElement" style={styles.answerButtonInner}>

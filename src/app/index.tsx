@@ -5,10 +5,14 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
-import { CHARACTERS_BY_ID } from '@/data/characters';
 import { useAppState } from '@/hooks/use-app-state';
-import { DailyCounts, LearnedChar, daysBetween, targetReps, todayKey } from '@/lib/progress';
+import { DailyCounts, LearnedChar, daysBetween, resolveCharacterDisplay, targetReps, todayKey } from '@/lib/progress';
 import { speak } from '@/lib/speech';
+
+// Scales down for multi-character words so they still fit the row.
+function hanziFontSize(length: number): number {
+  return length > 1 ? Math.max(24, 48 - (length - 1) * 8) : 48;
+}
 
 function CharacterRow({
   learned,
@@ -23,8 +27,7 @@ function CharacterRow({
   onWrite: () => void;
   onSpeak: () => void;
 }) {
-  const char = CHARACTERS_BY_ID.get(learned.id);
-  if (!char) return null;
+  const char = resolveCharacterDisplay(learned);
 
   const target = targetReps(daysBetween(learned.dateAdded, todayKey()));
   const backgroundType = isNewToday ? 'backgroundSelected' : 'backgroundElement';
@@ -32,7 +35,7 @@ function CharacterRow({
   return (
     <ThemedView type={backgroundType} style={styles.row}>
       <ThemedView style={styles.hanziBlock} type={backgroundType}>
-        <ThemedText style={styles.hanzi}>{char.hanzi}</ThemedText>
+        <ThemedText style={[styles.hanzi, { fontSize: hanziFontSize(char.hanzi.length) }]}>{char.hanzi}</ThemedText>
         <ThemedText type="small" themeColor="textSecondary">
           {char.pinyin}
         </ThemedText>
