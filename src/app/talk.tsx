@@ -1,17 +1,21 @@
-import { useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { MaxContentWidth, Spacing } from '@/constants/theme';
-import { useSpeechRecognition } from '@/hooks/use-speech-recognition';
+import { useTalkSession } from '@/hooks/use-talk-session';
+
+const STATE_LABEL: Record<string, string> = {
+  idle: 'Start',
+  listening: 'Listening…',
+  thinking: 'Thinking…',
+  speaking: 'Speaking…',
+};
 
 export default function TalkScreen() {
-  const [log, setLog] = useState<string[]>([]);
-  const { listening, start, stop, error } = useSpeechRecognition((text) => {
-    setLog((prev) => [text, ...prev]);
-  });
+  const { callState, transcriptLog, startCall, endCall } = useTalkSession();
+  const active = callState !== 'idle';
 
   return (
     <ThemedView style={styles.container}>
@@ -19,25 +23,18 @@ export default function TalkScreen() {
         <ThemedText type="title" style={styles.title}>
           Talk
         </ThemedText>
-        <ThemedText type="small" themeColor="textSecondary">
-          {listening ? 'Listening…' : 'Not listening'}
-        </ThemedText>
-        {error && (
-          <ThemedText type="small" themeColor="textSecondary">
-            Error: {error}
-          </ThemedText>
-        )}
 
-        <Pressable onPress={listening ? stop : start}>
-          <ThemedView type={listening ? 'backgroundSelected' : 'backgroundElement'} style={styles.button}>
-            <ThemedText type="smallBold">{listening ? 'Stop' : 'Start'}</ThemedText>
+        <Pressable onPress={active ? endCall : startCall}>
+          <ThemedView type={active ? 'backgroundSelected' : 'backgroundElement'} style={styles.button}>
+            <ThemedText type="smallBold">{active ? `${STATE_LABEL[callState]} (tap to end)` : 'Start'}</ThemedText>
           </ThemedView>
         </Pressable>
 
         <ScrollView style={styles.log} contentContainerStyle={styles.logContent}>
-          {log.map((entry, i) => (
-            <ThemedText key={i} style={styles.logEntry}>
-              {entry}
+          {[...transcriptLog].reverse().map((entry, i) => (
+            <ThemedText key={i} type={entry.role === 'user' ? 'default' : 'smallBold'} style={styles.logEntry}>
+              {entry.role === 'user' ? 'You: ' : 'Tutor: '}
+              {entry.text}
             </ThemedText>
           ))}
         </ScrollView>
