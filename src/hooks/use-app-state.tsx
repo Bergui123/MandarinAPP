@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useCallback, useEffect, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useState } from 'react';
 
 import {
   addConversationWord,
@@ -14,7 +14,7 @@ import {
 
 const STORAGE_KEY = '@mandarin/state';
 
-export function useAppState() {
+function useAppStateValue() {
   const [state, setState] = useState<AppState>(EMPTY_STATE);
   const [ready, setReady] = useState(false);
 
@@ -34,7 +34,9 @@ export function useAppState() {
   const persist = useCallback((updater: (prev: AppState) => AppState) => {
     setState((prev) => {
       const next = updater(prev);
-      AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch((err) =>
+        console.warn('Failed to save app state', err)
+      );
       return next;
     });
   }, []);
@@ -66,4 +68,22 @@ export function useAppState() {
     updateNotes: updateNotesAction,
     updateTalkMemory: updateTalkMemoryAction,
   };
+}
+
+type AppStateApi = ReturnType<typeof useAppStateValue>;
+
+const AppStateContext = createContext<AppStateApi | null>(null);
+
+// One instance of useAppStateValue, shared by every screen via context — without
+// this, Practice/Quiz/Talk each held an independent AsyncStorage-backed copy and
+// could silently clobber each other's saves (whichever screen saved last won).
+export function AppStateProvider({ children }: { children: React.ReactNode }) {
+  const value = useAppStateValue();
+  return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>;
+}
+
+export function useAppState(): AppStateApi {
+  const ctx = useContext(AppStateContext);
+  if (!ctx) throw new Error('useAppState must be used within an AppStateProvider');
+  return ctx;
 }

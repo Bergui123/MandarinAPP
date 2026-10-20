@@ -14,7 +14,7 @@ const STATE_LABEL: Record<string, string> = {
 };
 
 export default function TalkScreen() {
-  const { callState, transcriptLog, startCall, endCall } = useTalkSession();
+  const { callState, transcriptLog, startCall, endCall, error } = useTalkSession();
   const active = callState !== 'idle';
 
   return (
@@ -23,6 +23,12 @@ export default function TalkScreen() {
         <ThemedText type="title" style={styles.title}>
           Talk
         </ThemedText>
+
+        {error && (
+          <ThemedText type="small" themeColor="textSecondary">
+            {error}
+          </ThemedText>
+        )}
 
         <Pressable onPress={active ? endCall : startCall}>
           <ThemedView type={active ? 'backgroundSelected' : 'backgroundElement'} style={styles.button}>

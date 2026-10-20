@@ -41,12 +41,19 @@ export function isGoodbye(transcript: string): boolean {
   return GOODBYE_PATTERN.test(transcript);
 }
 
-const RECENT_TURNS_LIMIT = 15;
+// Errors that are routine/transient during normal continuous listening (a pause
+// in speech, a momentary audio-session interruption) — worth an automatic retry.
+// Everything else (permission, network, config problems) is surfaced instead,
+// since silently retrying those just loops forever with no feedback.
+const TRANSIENT_ERROR_CODES = new Set(['interrupted', 'no-speech', 'speech-timeout', 'busy']);
+
+const RECENT_TURNS_LIMIT = 15; // chat-context window sent with each request
+const EXCHANGE_THRESHOLD = 15; // how many exchanges accumulate before summarizing
+const SPEAKING_SAFETY_TIMEOUT_MS = 20000;
 const GOODBYE_REPLY = '再见！';
 const ERROR_FALLBACK_REPLY = "Sorry, I'm having trouble connecting, let's try again.";
-const EXCHANGE_THRESHOLD = 15;
 
-// Any known word whose hanzi appears anywhere in the recent turns' text —
+// Any known word whose hanzi appears anywhere in the given turns' text —
 // simple substring matching, no word segmentation needed for this purpose.
 function findTouchedHanzi(turns: ChatMessage[], learned: LearnedChar[]): string[] {
   const text = turns.map((t) => t.content).join(' ');
@@ -64,7 +71,10 @@ export async function summarizeAndUpdateMemory(
   try {
     const raw = await chatComplete([{ role: 'user', content: prompt }], { json: true });
     const parsed = JSON.parse(raw);
-    return { memory: parsed.memory ?? currentMemory, notes: Array.isArray(parsed.notes) ? parsed.notes : [] };
+    return {
+      memory: typeof parsed.memory === 'string' ? parsed.memory : currentMemory,
+      notes: Array.isArray(parsed.notes) ? parsed.notes : [],
+    };
   } catch {
     return { memory: currentMemory, notes: [] };
   }
@@ -76,7 +86,14 @@ export function useTalkSession() {
   const [transcriptLog, setTranscriptLog] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
 
   const recentTurnsRef = useRef<ChatMessage[]>([]);
+  // Separate from recentTurnsRef (which is trimmed to RECENT_TURNS_LIMIT for chat
+  // context): accumulates every turn since the last memory summary, uncapped,
+  // cleared after each summary — otherwise a summary only ever sees a fraction
+  // of the exchanges it was supposed to cover.
+  const turnsSinceSummaryRef = useRef<ChatMessage[]>([]);
   const callActiveRef = useRef(false);
+  const busyRef = useRef(false); // true while a request is in flight or a reply is playing
+  const generationRef = useRef(0); // bumped on start/end so stale async work can detect it's stale
   const stateRef = useRef(state);
   useEffect(() => {
     stateRef.current = state;
@@ -87,11 +104,11 @@ export function useTalkSession() {
   const startRef = useRef<() => void>(() => {});
   const stopRef = useRef<() => void>(() => {});
 
-  // Periodic memory/notes summarization — runs in the background, never blocks
-  // the listen/reply loop. Applies the result via useAppState's actions.
   const exchangeCountRef = useRef(0);
   const runMemoryUpdate = useCallback(() => {
-    const turns = recentTurnsRef.current;
+    const turns = turnsSinceSummaryRef.current;
+    if (turns.length === 0) return;
+    turnsSinceSummaryRef.current = [];
     const touched = findTouchedHanzi(turns, stateRef.current.learned);
     summarizeAndUpdateMemory(turns, stateRef.current.talkMemory, touched).then(({ memory, notes }) => {
       updateTalkMemory(memory);
@@ -109,17 +126,26 @@ export function useTalkSession() {
     }
   }, [runMemoryUpdate]);
   const flushMemoryUpdate = useCallback(() => {
-    if (recentTurnsRef.current.length === 0) return;
     exchangeCountRef.current = 0;
     runMemoryUpdate();
   }, [runMemoryUpdate]);
 
+  const speakingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearSpeakingTimeout = useCallback(() => {
+    if (speakingTimeoutRef.current) {
+      clearTimeout(speakingTimeoutRef.current);
+      speakingTimeoutRef.current = null;
+    }
+  }, []);
+
   const handleTranscript = useCallback(
     (transcript: string) => {
       if (!transcript.trim()) return;
+      if (busyRef.current) return; // a reply is already in flight/playing — ignore overlapping input
 
       if (isGoodbye(transcript)) {
         callActiveRef.current = false;
+        generationRef.current += 1;
         stopRef.current();
         flushMemoryUpdate();
         setCallState('idle');
@@ -129,10 +155,12 @@ export function useTalkSession() {
 
       // Pause recognition while we think/speak — continuous mode would otherwise
       // keep listening through the reply and could pick up the TTS audio itself.
+      busyRef.current = true;
       stopRef.current();
       setTranscriptLog((prev) => [...prev, { role: 'user', text: transcript }]);
       const userMessage: ChatMessage = { role: 'user', content: transcript };
       recentTurnsRef.current = [...recentTurnsRef.current, userMessage].slice(-RECENT_TURNS_LIMIT);
+      turnsSinceSummaryRef.current = [...turnsSinceSummaryRef.current, userMessage];
       setCallState('thinking');
 
       const messages: ChatMessage[] = [
@@ -143,57 +171,82 @@ export function useTalkSession() {
         ...recentTurnsRef.current,
       ];
 
+      const requestGeneration = generationRef.current;
       const resumeListening = () => {
-        if (!callActiveRef.current) return;
+        clearSpeakingTimeout();
+        busyRef.current = false;
+        if (requestGeneration !== generationRef.current || !callActiveRef.current) return;
         setCallState('listening');
         startRef.current();
       };
 
       chatComplete(messages)
         .then((reply) => {
+          if (requestGeneration !== generationRef.current) return; // call ended/restarted while this was in flight
           const { cleanText, newWords } = parseNewWordTags(reply);
           for (const word of newWords) addConversationWord(word);
           setTranscriptLog((prev) => [...prev, { role: 'assistant', text: cleanText }]);
           const assistantMessage: ChatMessage = { role: 'assistant', content: reply };
           recentTurnsRef.current = [...recentTurnsRef.current, assistantMessage].slice(-RECENT_TURNS_LIMIT);
+          turnsSinceSummaryRef.current = [...turnsSinceSummaryRef.current, assistantMessage];
           triggerMemoryUpdateIfDue();
           setCallState('speaking');
-          speak(cleanText, { rate: 0.75, onDone: resumeListening });
+          speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
+          speak(cleanText, { rate: 0.75, onSettled: resumeListening });
         })
         .catch(() => {
+          if (requestGeneration !== generationRef.current) return;
           setCallState('speaking');
-          speak(ERROR_FALLBACK_REPLY, { rate: 0.75, onDone: resumeListening });
+          speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
+          speak(ERROR_FALLBACK_REPLY, { rate: 0.75, onSettled: resumeListening });
         });
     },
-    [addConversationWord, flushMemoryUpdate, triggerMemoryUpdateIfDue]
+    [addConversationWord, clearSpeakingTimeout, flushMemoryUpdate, triggerMemoryUpdateIfDue]
   );
 
-  const { start, stop, error } = useSpeechRecognition(handleTranscript);
+  const { start, stop, error, listening } = useSpeechRecognition(handleTranscript);
   useEffect(() => {
     startRef.current = start;
     stopRef.current = stop;
   }, [start, stop]);
 
-  // Audio interruptions (e.g. an incoming phone call) surface as an 'error'
-  // event from the recognizer (error code "interrupted" on iOS — see Task 1's
-  // ledger notes). Stop any playback/listening; if the call is still active,
-  // best-effort retry listening. The library exposes no distinct "interruption
-  // ended" event, so this is a retry rather than a precise resume.
+  // Errors from the recognizer. Transient ones (a pause, an iOS audio-session
+  // interruption like a phone call) get an automatic retry. Anything else
+  // (permission, network, config) is surfaced instead of silently looping —
+  // see TRANSIENT_ERROR_CODES.
   useEffect(() => {
     if (!error) return;
     Speech.stop();
-    if (callActiveRef.current) {
+    if (callActiveRef.current && TRANSIENT_ERROR_CODES.has(error.code)) {
       setCallState('listening');
       startRef.current();
     } else {
+      callActiveRef.current = false;
       setCallState('idle');
     }
   }, [error]);
 
+  // The recognizer can also stop on its own without an error event. If it was
+  // actively listening and silently drops while we still expect it to be
+  // listening, restart — but only on that true->false edge, not on every
+  // render where `listening` just hasn't caught up to a deliberate start()
+  // yet (which would otherwise double-fire start() on every call/turn).
+  const wasListeningRef = useRef(false);
+  useEffect(() => {
+    const wasListening = wasListeningRef.current;
+    wasListeningRef.current = listening;
+    if (wasListening && !listening && callActiveRef.current && callState === 'listening') {
+      startRef.current();
+    }
+  }, [listening, callState]);
+
   const startCall = useCallback(() => {
     callActiveRef.current = true;
+    busyRef.current = false;
+    generationRef.current += 1;
     exchangeCountRef.current = 0;
     recentTurnsRef.current = [];
+    turnsSinceSummaryRef.current = [];
     setTranscriptLog([]);
     setCallState('listening');
     start();
@@ -201,11 +254,14 @@ export function useTalkSession() {
 
   const endCall = useCallback(() => {
     callActiveRef.current = false;
+    busyRef.current = false;
+    generationRef.current += 1; // invalidate any in-flight request's eventual reply
+    clearSpeakingTimeout();
     stop();
     Speech.stop();
     flushMemoryUpdate();
     setCallState('idle');
-  }, [stop, flushMemoryUpdate]);
+  }, [stop, clearSpeakingTimeout, flushMemoryUpdate]);
 
-  return { callState, transcriptLog, startCall, endCall };
+  return { callState, transcriptLog, startCall, endCall, error: error?.message ?? null };
 }

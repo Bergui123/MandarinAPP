@@ -35,13 +35,22 @@ export function isHanziTracked(state: AppState, hanzi: string): boolean {
 }
 
 // A word DeepSeek introduces in conversation joins the same tracked list Practice
-// reads from. Deduped by hanzi; ids start well above the static dataset's range.
+// reads from. Deduped by hanzi; ids start well above the static dataset's range —
+// unless the word is already in the static dataset, in which case it's added
+// under *that* entry's id so the daily unlock (unlockTodayIfNeeded) never finds
+// it "missing" and adds a second copy.
 export function addConversationWord(
   state: AppState,
   word: { hanzi: string; pinyin: string; meaning: string },
   today: string = todayKey()
 ): AppState {
-  if (isHanziTracked(state, word.hanzi)) return state;
+  const hanzi = word.hanzi.trim();
+  if (isHanziTracked(state, hanzi)) return state;
+
+  const staticEntry = CHARACTERS.find((c) => c.hanzi === hanzi);
+  if (staticEntry) {
+    return { ...state, learned: [...state.learned, { id: staticEntry.id, dateAdded: today }] };
+  }
 
   const usedIds = new Set(state.learned.map((c) => c.id));
   let id = CONVERSATION_ID_START;
@@ -49,7 +58,7 @@ export function addConversationWord(
 
   return {
     ...state,
-    learned: [...state.learned, { id, dateAdded: today, hanzi: word.hanzi, pinyin: word.pinyin, meaning: word.meaning }],
+    learned: [...state.learned, { id, dateAdded: today, hanzi, pinyin: word.pinyin, meaning: word.meaning }],
   };
 }
 
@@ -87,8 +96,11 @@ export function targetReps(daysKnown: number): number {
 }
 
 // Adds the next unseen character for today, if one hasn't already been added today.
+// Only counts static-dataset unlocks here — a word Talk mode introduced today
+// (identified by carrying its own hanzi) has its own pacing and must not block
+// or consume Practice's daily slot.
 export function unlockTodayIfNeeded(state: AppState, today: string = todayKey()): AppState {
-  const alreadyAddedToday = state.learned.some((c) => c.dateAdded === today);
+  const alreadyAddedToday = state.learned.some((c) => c.dateAdded === today && c.hanzi === undefined);
   if (alreadyAddedToday) return state;
 
   const learnedIds = new Set(state.learned.map((c) => c.id));
