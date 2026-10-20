@@ -44,9 +44,34 @@ export function isGoodbye(transcript: string): boolean {
 const RECENT_TURNS_LIMIT = 15;
 const GOODBYE_REPLY = '再见！';
 const ERROR_FALLBACK_REPLY = "Sorry, I'm having trouble connecting, let's try again.";
+const EXCHANGE_THRESHOLD = 15;
+
+// Any known word whose hanzi appears anywhere in the recent turns' text —
+// simple substring matching, no word segmentation needed for this purpose.
+function findTouchedHanzi(turns: ChatMessage[], learned: LearnedChar[]): string[] {
+  const text = turns.map((t) => t.content).join(' ');
+  return learned.map((c) => resolveCharacterDisplay(c).hanzi).filter((hanzi) => text.includes(hanzi));
+}
+
+export async function summarizeAndUpdateMemory(
+  recentTurns: ChatMessage[],
+  currentMemory: string,
+  touchedHanzi: string[]
+): Promise<{ memory: string; notes: { hanzi: string; note: string }[] }> {
+  const transcript = recentTurns.map((t) => `${t.role}: ${t.content}`).join('\n');
+  const prompt = `Here is a recent stretch of a Mandarin-tutoring conversation:\n${transcript}\n\nCurrent memory of this learner: ${currentMemory || '(nothing yet)'}\n\nWords touched in this stretch: ${touchedHanzi.join(', ') || '(none)'}\n\nRespond with json in exactly this shape: {"memory": "<updated, still-concise summary of topics covered, corrections made, and words the learner struggled with — fold in what's new, keep it bounded, don't just append>", "notes": [{"hanzi": "<one of the touched words>", "note": "<short read on how well the learner knows it>"}]}`;
+
+  try {
+    const raw = await chatComplete([{ role: 'user', content: prompt }], { json: true });
+    const parsed = JSON.parse(raw);
+    return { memory: parsed.memory ?? currentMemory, notes: Array.isArray(parsed.notes) ? parsed.notes : [] };
+  } catch {
+    return { memory: currentMemory, notes: [] };
+  }
+}
 
 export function useTalkSession() {
-  const { state, addConversationWord } = useAppState();
+  const { state, addConversationWord, updateNotes, updateTalkMemory } = useAppState();
   const [callState, setCallState] = useState<TalkState>('idle');
   const [transcriptLog, setTranscriptLog] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
 
@@ -62,17 +87,32 @@ export function useTalkSession() {
   const startRef = useRef<() => void>(() => {});
   const stopRef = useRef<() => void>(() => {});
 
-  // Exchange counter + flush hook for Task 7's periodic memory/notes summarization.
-  // Wired in Task 7 — a no-op here keeps this task's own contract (callState,
-  // transcriptLog, startCall, endCall) complete and independently testable.
+  // Periodic memory/notes summarization — runs in the background, never blocks
+  // the listen/reply loop. Applies the result via useAppState's actions.
   const exchangeCountRef = useRef(0);
+  const runMemoryUpdate = useCallback(() => {
+    const turns = recentTurnsRef.current;
+    const touched = findTouchedHanzi(turns, stateRef.current.learned);
+    summarizeAndUpdateMemory(turns, stateRef.current.talkMemory, touched).then(({ memory, notes }) => {
+      updateTalkMemory(memory);
+      for (const note of notes) {
+        const entry = stateRef.current.learned.find((c) => resolveCharacterDisplay(c).hanzi === note.hanzi);
+        if (entry) updateNotes(entry.id, note.note);
+      }
+    });
+  }, [updateNotes, updateTalkMemory]);
   const triggerMemoryUpdateIfDue = useCallback(() => {
     exchangeCountRef.current += 1;
-    // wired in Task 7
-  }, []);
+    if (exchangeCountRef.current >= EXCHANGE_THRESHOLD) {
+      exchangeCountRef.current = 0;
+      runMemoryUpdate();
+    }
+  }, [runMemoryUpdate]);
   const flushMemoryUpdate = useCallback(() => {
-    // wired in Task 7
-  }, []);
+    if (recentTurnsRef.current.length === 0) return;
+    exchangeCountRef.current = 0;
+    runMemoryUpdate();
+  }, [runMemoryUpdate]);
 
   const handleTranscript = useCallback(
     (transcript: string) => {
