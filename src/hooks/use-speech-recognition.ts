@@ -5,6 +5,7 @@ import {
   AVAudioSessionMode,
   ExpoSpeechRecognitionErrorCode,
   ExpoSpeechRecognitionModule,
+  TaskHintIOS,
   useSpeechRecognitionEvent,
 } from 'expo-speech-recognition';
 
@@ -51,6 +52,10 @@ export function useSpeechRecognition(onTranscript: (text: string) => void) {
         lang: 'zh-CN',
         continuous: true,
         interimResults: true,
+        // "confirmation" tells iOS this is a short conversational utterance, not
+        // long-form dictation — the default hint waits noticeably longer for a
+        // pause before finalizing, which is what read as "delay to understand".
+        iosTaskHint: TaskHintIOS.confirmation,
       });
     });
   }, []);
