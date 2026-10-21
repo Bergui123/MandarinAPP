@@ -44,15 +44,13 @@ export function useSpeechRecognition(onTranscript: (text: string) => void) {
         categoryOptions: [AVAudioSessionCategoryOptions.defaultToSpeaker, AVAudioSessionCategoryOptions.allowBluetooth],
         mode: AVAudioSessionMode.default,
       });
-      // Prefer on-device recognition (private, no per-use network dependency) when
-      // the device supports it at all; otherwise fall back to the default rather
-      // than forcing a flag that could make recognition fail outright.
-      const onDeviceSupported = ExpoSpeechRecognitionModule.supportsOnDeviceRecognition();
+      // Network-based (not on-device) recognition — observed meaningfully more
+      // accurate for Mandarin on real hardware (on-device misheard a plain "你好"
+      // entirely). Accuracy matters more here than the offline/privacy upside.
       ExpoSpeechRecognitionModule.start({
         lang: 'zh-CN',
         continuous: true,
         interimResults: true,
-        requiresOnDeviceRecognition: onDeviceSupported,
       });
     });
   }, []);

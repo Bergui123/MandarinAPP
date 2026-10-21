@@ -1,20 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import * as Speech from 'expo-speech';
 
 import { useAppState } from '@/hooks/use-app-state';
 import { useSpeechRecognition } from '@/hooks/use-speech-recognition';
 import { ChatMessage, chatComplete } from '@/lib/deepseek';
+import { speakWithElevenLabs, stopElevenLabsSpeech } from '@/lib/elevenlabs-speech';
 import { LearnedChar, resolveCharacterDisplay } from '@/lib/progress';
-import { speak } from '@/lib/speech';
 
 export type TalkState = 'idle' | 'listening' | 'thinking' | 'speaking';
+const SPEECH_RATE = 0.75; // slower, easier to follow while learning
 
 const SYSTEM_PROMPT = `You are a patient, friendly Mandarin tutor having a spoken phone conversation with a beginner learner.
-- Speak mostly in Mandarin, slowly, in short sentences (one or two sentences per turn) — this is spoken aloud, not read.
+- Speak mostly in Mandarin, slowly, in ONE short sentence per turn — this is spoken aloud in a moving car, not read. Never more than one sentence unless the learner explicitly asks for a longer explanation.
 - Mostly use words from the learner's known-word list below.
 - Occasionally introduce a new word, at a random and unforced pace — not every turn.
 - When you introduce a word that is NOT already in the learner's known-word list, wrap it inline exactly like this: ⟦hanzi|pinyin|meaning⟧ at the point you use it in the sentence. Never wrap a word that is already in the known-word list.
-- If the learner asks a question, or clearly needs help understanding something, answer or explain in English.`;
+- If the learner asks a question, or clearly needs help understanding something, answer or explain in English.
+- If you don't understand what the learner said (it may be a mis-transcription), ask ONE brief, calm clarifying question — never guess repeatedly or stack several guesses in one turn.`;
 
 function knownWordsBlock(learned: LearnedChar[]): string {
   return learned.map((c) => resolveCharacterDisplay(c).hanzi).join(', ');
@@ -149,7 +150,7 @@ export function useTalkSession() {
         stopRef.current();
         flushMemoryUpdate();
         setCallState('idle');
-        speak(GOODBYE_REPLY, { rate: 0.75 });
+        speakWithElevenLabs(GOODBYE_REPLY, { rate: SPEECH_RATE });
         return;
       }
 
@@ -192,13 +193,13 @@ export function useTalkSession() {
           triggerMemoryUpdateIfDue();
           setCallState('speaking');
           speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
-          speak(cleanText, { rate: 0.75, onSettled: resumeListening });
+          speakWithElevenLabs(cleanText, { rate: SPEECH_RATE, onSettled: resumeListening });
         })
         .catch(() => {
           if (requestGeneration !== generationRef.current) return;
           setCallState('speaking');
           speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
-          speak(ERROR_FALLBACK_REPLY, { rate: 0.75, onSettled: resumeListening });
+          speakWithElevenLabs(ERROR_FALLBACK_REPLY, { rate: SPEECH_RATE, onSettled: resumeListening });
         });
     },
     [addConversationWord, clearSpeakingTimeout, flushMemoryUpdate, triggerMemoryUpdateIfDue]
@@ -216,7 +217,7 @@ export function useTalkSession() {
   // see TRANSIENT_ERROR_CODES.
   useEffect(() => {
     if (!error) return;
-    Speech.stop();
+    stopElevenLabsSpeech();
     if (callActiveRef.current && TRANSIENT_ERROR_CODES.has(error.code)) {
       setCallState('listening');
       startRef.current();
@@ -258,7 +259,7 @@ export function useTalkSession() {
     generationRef.current += 1; // invalidate any in-flight request's eventual reply
     clearSpeakingTimeout();
     stop();
-    Speech.stop();
+    stopElevenLabsSpeech();
     flushMemoryUpdate();
     setCallState('idle');
   }, [stop, clearSpeakingTimeout, flushMemoryUpdate]);
