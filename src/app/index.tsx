@@ -1,13 +1,24 @@
 import { useMemo } from 'react';
-import { FlatList, Platform, Pressable, StyleSheet } from 'react-native';
+import { FlatList, Platform, Pressable, Share, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
+import { LanguageSwitcher } from '@/components/language-switcher';
 import { useAppState } from '@/hooks/use-app-state';
-import { DailyCounts, LearnedChar, daysBetween, resolveCharacterDisplay, targetReps, todayKey } from '@/lib/progress';
+import {
+  buildProgressSummary,
+  DailyCounts,
+  Language,
+  LearnedChar,
+  daysBetween,
+  resolveCharacterDisplay,
+  targetReps,
+  todayKey,
+} from '@/lib/progress';
 import { speak } from '@/lib/speech';
+import { SPEECH_LOCALE } from '@/lib/language-locale';
 
 // Scales down for multi-character words so they still fit the row.
 function hanziFontSize(length: number): number {
@@ -16,18 +27,20 @@ function hanziFontSize(length: number): number {
 
 function CharacterRow({
   learned,
+  lang,
   isNewToday,
   counts,
   onWrite,
   onSpeak,
 }: {
   learned: LearnedChar;
+  lang: Language;
   isNewToday: boolean;
   counts: DailyCounts;
   onWrite: () => void;
   onSpeak: () => void;
 }) {
-  const char = resolveCharacterDisplay(learned);
+  const char = resolveCharacterDisplay(learned, lang);
 
   const target = targetReps(daysBetween(learned.dateAdded, todayKey()));
   const backgroundType = isNewToday ? 'backgroundSelected' : 'backgroundElement';
@@ -40,6 +53,16 @@ function CharacterRow({
           {char.pinyin}
         </ThemedText>
         <ThemedText type="small">{char.meaning}</ThemedText>
+        {learned.pronunciation && (
+          <ThemedText type="small" themeColor="textSecondary">
+            {learned.pronunciation}
+          </ThemedText>
+        )}
+        {learned.notes && (
+          <ThemedText type="small" themeColor="textSecondary">
+            {learned.notes}
+          </ThemedText>
+        )}
       </ThemedView>
 
       <ThemedView style={styles.counters} type={backgroundType}>
@@ -53,7 +76,7 @@ function CharacterRow({
         <Pressable
           style={styles.counterButton}
           onPress={() => {
-            speak(char.hanzi);
+            speak(char.hanzi, { language: SPEECH_LOCALE[lang] });
             onSpeak();
           }}>
           <ThemedText type="smallBold">🔊 Say</ThemedText>
@@ -67,7 +90,7 @@ function CharacterRow({
 }
 
 export default function PracticeScreen() {
-  const { state, ready, addWrite, addSpeak } = useAppState();
+  const { state, language, setLanguage, ready, addWrite, addSpeak } = useAppState();
 
   const today = todayKey();
   const ordered = useMemo(
@@ -89,6 +112,14 @@ export default function PracticeScreen() {
         <ThemedText type="title" style={styles.title}>
           Today
         </ThemedText>
+        <ThemedView style={styles.headerRow}>
+          <LanguageSwitcher language={language} onChange={setLanguage} />
+          <Pressable onPress={() => Share.share({ message: buildProgressSummary(state, language) })}>
+            <ThemedView type="backgroundElement" style={styles.shareButton}>
+              <ThemedText type="smallBold">Share progress</ThemedText>
+            </ThemedView>
+          </Pressable>
+        </ThemedView>
         <ThemedText type="small" themeColor="textSecondary">
           {ordered.length} character{ordered.length === 1 ? '' : 's'} learned so far
         </ThemedText>
@@ -101,6 +132,7 @@ export default function PracticeScreen() {
           renderItem={({ item }) => (
             <CharacterRow
               learned={item}
+              lang={language}
               isNewToday={item.dateAdded === today}
               counts={state.dailyCounts[today]?.[String(item.id)] ?? { write: 0, speak: 0 }}
               onWrite={() => addWrite(item.id)}
@@ -116,6 +148,19 @@ export default function PracticeScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+  },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+    maxWidth: MaxContentWidth,
+    paddingHorizontal: Spacing.three,
+  },
+  shareButton: {
+    paddingVertical: Spacing.one,
+    paddingHorizontal: Spacing.three,
+    borderRadius: Spacing.three,
   },
   safeArea: {
     flex: 1,

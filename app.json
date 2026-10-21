@@ -16,6 +16,8 @@
         ],
         "NSSpeechRecognitionUsageDescription": "Allow $(PRODUCT_NAME) to use speech recognition.",
         "NSMicrophoneUsageDescription": "Allow $(PRODUCT_NAME) to use the microphone.",
+        "NSLocationWhenInUseUsageDescription": "Allow $(PRODUCT_NAME) to use your location to bring up the weather in conversation.",
+        "NSCalendarsUsageDescription": "Allow $(PRODUCT_NAME) to read your calendar so the tutor can ask about your day.",
         "ITSAppUsesNonExemptEncryption": false
       }
     },
@@ -46,7 +48,20 @@
         }
       ],
       "expo-speech-recognition",
-      "expo-audio"
+      "expo-audio",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow $(PRODUCT_NAME) to use your location to bring up the weather in conversation."
+        }
+      ],
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Allow $(PRODUCT_NAME) to read your calendar so the tutor can ask about your day."
+        }
+      ],
+      "expo-quick-actions"
     ],
     "experiments": {
       "typedRoutes": true,

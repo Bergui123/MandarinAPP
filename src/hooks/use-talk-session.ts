@@ -2,23 +2,44 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { useAppState } from '@/hooks/use-app-state';
 import { useSpeechRecognition } from '@/hooks/use-speech-recognition';
-import { ChatMessage, chatComplete } from '@/lib/deepseek';
-import { speakWithElevenLabs, stopElevenLabsSpeech } from '@/lib/elevenlabs-speech';
-import { LearnedChar, resolveCharacterDisplay } from '@/lib/progress';
+import { getContextSignals } from '@/lib/context-signals';
+import { ChatMessage, chatComplete, chatCompleteStream } from '@/lib/deepseek';
+import { enqueueElevenLabsSpeech, stopElevenLabsSpeech } from '@/lib/elevenlabs-speech';
+import { SPEECH_LOCALE } from '@/lib/language-locale';
+import { Difficulty, Language, LearnedChar, resolveCharacterDisplay, SessionPlan } from '@/lib/progress';
 
 export type TalkState = 'idle' | 'listening' | 'thinking' | 'speaking';
+export type SessionPlanDraft = { focusWords: string[]; topics: string[]; goal: string };
 const SPEECH_RATE = 0.75; // slower, easier to follow while learning
 
-const SYSTEM_PROMPT = `You are a patient, friendly Mandarin tutor having a spoken phone conversation with a beginner learner.
-- Speak mostly in Mandarin, slowly, in ONE short sentence per turn — this is spoken aloud in a moving car, not read. Never more than one sentence unless the learner explicitly asks for a longer explanation.
+const LANGUAGE_NAME: Record<Language, string> = { zh: 'Mandarin', fr: 'French' };
+const DIFFICULTY_GUIDANCE: Record<Difficulty, string> = {
+  review: 'The learner asked for a review-focused session: stick almost entirely to already-known words, introduce new vocabulary rarely if at all.',
+  balanced: 'The learner asked for a balanced session: mostly known words, with new vocabulary introduced at the normal unforced pace.',
+  challenge: 'The learner asked for a challenging session: push new vocabulary and slightly more complex sentences more often than usual, while staying within a beginner’s reach.',
+};
+
+function systemPrompt(lang: Language, difficulty: Difficulty): string {
+  const name = LANGUAGE_NAME[lang];
+  return `You are a patient, friendly ${name} tutor having a spoken phone conversation with a beginner learner.
+- Speak mostly in ${name}, slowly, in ONE short sentence per turn — this is spoken aloud in a moving car, not read. Never more than one sentence unless the learner explicitly asks for a longer explanation.
 - Mostly use words from the learner's known-word list below.
 - Occasionally introduce a new word, at a random and unforced pace — not every turn.
-- When you introduce a word that is NOT already in the learner's known-word list, wrap it inline exactly like this: ⟦hanzi|pinyin|meaning⟧ at the point you use it in the sentence. Never wrap a word that is already in the known-word list.
+- ${DIFFICULTY_GUIDANCE[difficulty]}
+- When you introduce a word that is NOT already in the learner's known-word list, wrap it inline exactly like this: ⟦word|pronunciation|meaning⟧ at the point you use it in the sentence. Never wrap a word that is already in the known-word list.
+- If the learner mispronounces or misuses a known word, or makes a grammar mistake, gently give the correct form in the same sentence before continuing — don't just move on as if it were right.
+- You're given the learner's current time, weather, and rest-of-day schedule below. Occasionally weave one of these into a question or remark, at the same random, unforced pace as new vocabulary — not every turn, and never more than one of them in the same turn.
 - If the learner asks a question, or clearly needs help understanding something, answer or explain in English.
 - If you don't understand what the learner said (it may be a mis-transcription), ask ONE brief, calm clarifying question — never guess repeatedly or stack several guesses in one turn.`;
+}
 
-function knownWordsBlock(learned: LearnedChar[]): string {
-  return learned.map((c) => resolveCharacterDisplay(c).hanzi).join(', ');
+function knownWordsBlock(learned: LearnedChar[], lang: Language): string {
+  return learned.map((c) => resolveCharacterDisplay(c, lang).hanzi).join(', ');
+}
+
+function planBlock(plan: SessionPlanDraft | null): string {
+  if (!plan || (!plan.goal && plan.focusWords.length === 0 && plan.topics.length === 0)) return '(no plan set)';
+  return `Goal: ${plan.goal || '(none)'}. Focus words: ${plan.focusWords.join(', ') || '(none)'}. Topics: ${plan.topics.join(', ') || '(none)'}.`;
 }
 
 export function parseNewWordTags(reply: string): {
@@ -34,12 +55,45 @@ export function parseNewWordTags(reply: string): {
   return { cleanText, newWords };
 }
 
-const GOODBYE_PATTERN = /再见|拜拜|goodbye|bye|结束|end call/i;
+// As streamed tokens accumulate, cuts off complete sentences one at a time so
+// each can be sent to TTS immediately instead of waiting for the full reply.
+// Skips a sentence-ending punctuation mark while inside an unclosed ⟦...⟧ tag
+// (bracket count unbalanced up to that point) so a tag's content never splits.
+export function extractCompleteSentences(buffer: string): { sentences: string[]; rest: string } {
+  const sentences: string[] = [];
+  let rest = buffer;
+  const enderRegex = /[。！？.!?]/g;
+  for (;;) {
+    enderRegex.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    let cut = -1;
+    while ((match = enderRegex.exec(rest))) {
+      const endIdx = match.index + 1;
+      const prefix = rest.slice(0, endIdx);
+      const openCount = (prefix.match(/⟦/g) ?? []).length;
+      const closeCount = (prefix.match(/⟧/g) ?? []).length;
+      if (openCount === closeCount) {
+        cut = endIdx;
+        break;
+      }
+    }
+    if (cut === -1) break;
+    sentences.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  return { sentences, rest };
+}
+
+const GOODBYE_PATTERN: Record<Language, RegExp> = {
+  zh: /再见|拜拜|goodbye|bye|结束|end call/i,
+  fr: /au revoir|\bbye\b|goodbye|end call/i,
+};
+const GOODBYE_REPLY: Record<Language, string> = { zh: '再见！', fr: 'Au revoir !' };
 
 // Intentionally imprecise — a mid-sentence mention of one of these words is a
 // known false positive. The manual End button in talk.tsx is the reliable path.
-export function isGoodbye(transcript: string): boolean {
-  return GOODBYE_PATTERN.test(transcript);
+export function isGoodbye(transcript: string, lang: Language): boolean {
+  return GOODBYE_PATTERN[lang].test(transcript);
 }
 
 // Errors that are routine/transient during normal continuous listening (a pause
@@ -51,23 +105,24 @@ const TRANSIENT_ERROR_CODES = new Set(['interrupted', 'no-speech', 'speech-timeo
 const RECENT_TURNS_LIMIT = 15; // chat-context window sent with each request
 const EXCHANGE_THRESHOLD = 15; // how many exchanges accumulate before summarizing
 const SPEAKING_SAFETY_TIMEOUT_MS = 20000;
-const GOODBYE_REPLY = '再见！';
 const ERROR_FALLBACK_REPLY = "Sorry, I'm having trouble connecting, let's try again.";
+const MAX_CONTEXTUAL_STRINGS = 100; // SFSpeechRecognitionRequest.contextualStrings isn't meant for huge lists
 
 // Any known word whose hanzi appears anywhere in the given turns' text —
 // simple substring matching, no word segmentation needed for this purpose.
-function findTouchedHanzi(turns: ChatMessage[], learned: LearnedChar[]): string[] {
+function findTouchedHanzi(turns: ChatMessage[], learned: LearnedChar[], lang: Language): string[] {
   const text = turns.map((t) => t.content).join(' ');
-  return learned.map((c) => resolveCharacterDisplay(c).hanzi).filter((hanzi) => text.includes(hanzi));
+  return learned.map((c) => resolveCharacterDisplay(c, lang).hanzi).filter((hanzi) => text.includes(hanzi));
 }
 
 export async function summarizeAndUpdateMemory(
   recentTurns: ChatMessage[],
   currentMemory: string,
-  touchedHanzi: string[]
-): Promise<{ memory: string; notes: { hanzi: string; note: string }[] }> {
+  touchedHanzi: string[],
+  currentPlan: SessionPlanDraft | null
+): Promise<{ memory: string; notes: { hanzi: string; note: string }[]; plan: SessionPlanDraft | null }> {
   const transcript = recentTurns.map((t) => `${t.role}: ${t.content}`).join('\n');
-  const prompt = `Here is a recent stretch of a Mandarin-tutoring conversation:\n${transcript}\n\nCurrent memory of this learner: ${currentMemory || '(nothing yet)'}\n\nWords touched in this stretch: ${touchedHanzi.join(', ') || '(none)'}\n\nRespond with json in exactly this shape: {"memory": "<updated, still-concise summary of topics covered, corrections made, and words the learner struggled with — fold in what's new, keep it bounded, don't just append>", "notes": [{"hanzi": "<one of the touched words>", "note": "<short read on how well the learner knows it>"}]}`;
+  const prompt = `Here is a recent stretch of a language-tutoring conversation:\n${transcript}\n\nCurrent memory of this learner: ${currentMemory || '(nothing yet)'}\n\nWords touched in this stretch: ${touchedHanzi.join(', ') || '(none)'}\n\nCurrent session plan: ${planBlock(currentPlan)}\n\nRespond with json in exactly this shape: {"memory": "<updated, still-concise summary of topics covered, corrections made, and words the learner struggled with — fold in what's new, keep it bounded, don't just append>", "notes": [{"hanzi": "<one of the touched words>", "note": "<short read on how well the learner knows it>"}], "plan": {"focusWords": ["..."], "topics": ["..."], "goal": "<one short sentence, adjusted for how the learner is actually doing so far>"}}`;
 
   try {
     const raw = await chatComplete([{ role: 'user', content: prompt }], { json: true });
@@ -75,16 +130,50 @@ export async function summarizeAndUpdateMemory(
     return {
       memory: typeof parsed.memory === 'string' ? parsed.memory : currentMemory,
       notes: Array.isArray(parsed.notes) ? parsed.notes : [],
+      plan:
+        parsed.plan && typeof parsed.plan === 'object'
+          ? {
+              focusWords: Array.isArray(parsed.plan.focusWords) ? parsed.plan.focusWords : [],
+              topics: Array.isArray(parsed.plan.topics) ? parsed.plan.topics : [],
+              goal: typeof parsed.plan.goal === 'string' ? parsed.plan.goal : '',
+            }
+          : currentPlan,
     };
   } catch {
-    return { memory: currentMemory, notes: [] };
+    return { memory: currentMemory, notes: [], plan: currentPlan };
+  }
+}
+
+export async function planSession(
+  durationMin: number,
+  learned: LearnedChar[],
+  talkMemory: string,
+  history: SessionPlan[],
+  lang: Language,
+  difficulty: Difficulty
+): Promise<SessionPlanDraft> {
+  const prompt = `Plan a ${durationMin}-minute ${LANGUAGE_NAME[lang]} speaking-practice session for a beginner learner.\nKnown words: ${knownWordsBlock(learned, lang) || '(none yet)'}\nWhat you remember about this learner: ${talkMemory || '(nothing yet)'}\nRecent past session plans, most recent last (JSON, for your own reference, never shown to the learner): ${JSON.stringify(history.slice(-3))}\n${DIFFICULTY_GUIDANCE[difficulty]}\n\nRespond with json in exactly this shape: {"focusWords": ["..."], "topics": ["..."], "goal": "<one short sentence>"}`;
+
+  try {
+    const raw = await chatComplete([{ role: 'user', content: prompt }], { json: true });
+    const parsed = JSON.parse(raw);
+    return {
+      focusWords: Array.isArray(parsed.focusWords) ? parsed.focusWords : [],
+      topics: Array.isArray(parsed.topics) ? parsed.topics : [],
+      goal: typeof parsed.goal === 'string' ? parsed.goal : '',
+    };
+  } catch {
+    return { focusWords: [], topics: [], goal: '' };
   }
 }
 
 export function useTalkSession() {
-  const { state, addConversationWord, updateNotes, updateTalkMemory } = useAppState();
+  const { state, language, addConversationWord, updateNotes, updateTalkMemory, addSessionPlan, updatePronunciation } =
+    useAppState();
   const [callState, setCallState] = useState<TalkState>('idle');
   const [transcriptLog, setTranscriptLog] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
+  const [planning, setPlanning] = useState(false);
+  const [currentPlan, setCurrentPlan] = useState<SessionPlanDraft | null>(null);
 
   const recentTurnsRef = useRef<ChatMessage[]>([]);
   // Separate from recentTurnsRef (which is trimmed to RECENT_TURNS_LIMIT for chat
@@ -95,10 +184,18 @@ export function useTalkSession() {
   const callActiveRef = useRef(false);
   const busyRef = useRef(false); // true while a request is in flight or a reply is playing
   const generationRef = useRef(0); // bumped on start/end so stale async work can detect it's stale
+  const languageRef = useRef(language);
   const stateRef = useRef(state);
   useEffect(() => {
     stateRef.current = state;
+    languageRef.current = language;
   });
+
+  const currentPlanRef = useRef<SessionPlanDraft | null>(null);
+  const durationMinRef = useRef(0);
+  const callStartedAtRef = useRef(0);
+  const contextSignalsRef = useRef(''); // time/weather/schedule, fetched once per call
+  const awaitingEchoRef = useRef<string[]>([]); // known words the tutor just modeled, for the pronunciation heuristic
 
   // Forward refs: handleTranscript needs start/stop, but those only exist once
   // useSpeechRecognition(handleTranscript) has been called below.
@@ -110,14 +207,19 @@ export function useTalkSession() {
     const turns = turnsSinceSummaryRef.current;
     if (turns.length === 0) return;
     turnsSinceSummaryRef.current = [];
-    const touched = findTouchedHanzi(turns, stateRef.current.learned);
-    summarizeAndUpdateMemory(turns, stateRef.current.talkMemory, touched).then(({ memory, notes }) => {
-      updateTalkMemory(memory);
-      for (const note of notes) {
-        const entry = stateRef.current.learned.find((c) => resolveCharacterDisplay(c).hanzi === note.hanzi);
-        if (entry) updateNotes(entry.id, note.note);
+    const lang = languageRef.current;
+    const touched = findTouchedHanzi(turns, stateRef.current.learned, lang);
+    summarizeAndUpdateMemory(turns, stateRef.current.talkMemory, touched, currentPlanRef.current).then(
+      ({ memory, notes, plan }) => {
+        updateTalkMemory(memory);
+        for (const note of notes) {
+          const entry = stateRef.current.learned.find((c) => resolveCharacterDisplay(c, lang).hanzi === note.hanzi);
+          if (entry) updateNotes(entry.id, note.note);
+        }
+        currentPlanRef.current = plan;
+        setCurrentPlan(plan);
       }
-    });
+    );
   }, [updateNotes, updateTalkMemory]);
   const triggerMemoryUpdateIfDue = useCallback(() => {
     exchangeCountRef.current += 1;
@@ -139,20 +241,45 @@ export function useTalkSession() {
     }
   }, []);
 
+  const contextualStringsFor = useCallback((learned: LearnedChar[], lang: Language) => {
+    const words = learned.map((c) => resolveCharacterDisplay(c, lang).hanzi).slice(-MAX_CONTEXTUAL_STRINGS);
+    return [...words, GOODBYE_REPLY[lang]];
+  }, []);
+
   const handleTranscript = useCallback(
     (transcript: string) => {
       if (!transcript.trim()) return;
       if (busyRef.current) return; // a reply is already in flight/playing — ignore overlapping input
 
-      if (isGoodbye(transcript)) {
+      const lang = languageRef.current;
+
+      if (isGoodbye(transcript, lang)) {
         callActiveRef.current = false;
         generationRef.current += 1;
         stopRef.current();
         flushMemoryUpdate();
         setCallState('idle');
-        speakWithElevenLabs(GOODBYE_REPLY, { rate: SPEECH_RATE });
+        enqueueElevenLabsSpeech(GOODBYE_REPLY[lang], { rate: SPEECH_RATE });
         return;
       }
+
+      // Pronunciation heuristic: did the learner echo back any word the tutor
+      // modeled in its last reply? Local string match only, no API call —
+      // ponytail: substring/whole-word match, not a real phoneme check; a
+      // miss here just means "didn't say that word back," not "said it wrong."
+      // Most-recent-evidence-wins, same policy as the DeepSeek-driven notes.
+      for (const word of awaitingEchoRef.current) {
+        const said = lang === 'zh' ? transcript.includes(word) : transcript.toLowerCase().includes(word.toLowerCase());
+        const entry = stateRef.current.learned.find((c) => resolveCharacterDisplay(c, lang).hanzi === word);
+        if (!entry) continue;
+        updatePronunciation(
+          entry.id,
+          said
+            ? 'Practiced in conversation: said it back correctly.'
+            : "Practiced in conversation: didn't say it back when prompted — worth repeating."
+        );
+      }
+      awaitingEchoRef.current = [];
 
       // Pause recognition while we think/speak — continuous mode would otherwise
       // keep listening through the reply and could pick up the TTS audio itself.
@@ -164,10 +291,11 @@ export function useTalkSession() {
       turnsSinceSummaryRef.current = [...turnsSinceSummaryRef.current, userMessage];
       setCallState('thinking');
 
+      const overtime = durationMinRef.current > 0 && Date.now() - callStartedAtRef.current > durationMinRef.current * 60_000;
       const messages: ChatMessage[] = [
         {
           role: 'system',
-          content: `${SYSTEM_PROMPT}\n\nKnown words: ${knownWordsBlock(stateRef.current.learned)}\n\nWhat you remember about this learner so far: ${stateRef.current.talkMemory || '(nothing yet)'}`,
+          content: `${systemPrompt(lang, stateRef.current.difficulty)}\n\nKnown words: ${knownWordsBlock(stateRef.current.learned, lang)}\n\nWhat you remember about this learner so far: ${stateRef.current.talkMemory || '(nothing yet)'}\n\nSession plan: ${planBlock(currentPlanRef.current)}\n\n${contextSignalsRef.current || '(no time/weather/schedule context available)'}${overtime ? '\n\nThe planned session time is up — start wrapping the conversation toward a natural close over the next turn or two.' : ''}`,
         },
         ...recentTurnsRef.current,
       ];
@@ -181,35 +309,74 @@ export function useTalkSession() {
         startRef.current();
       };
 
-      chatComplete(messages)
+      // Streams the reply so each sentence can start speaking as soon as it's
+      // complete, instead of waiting for the full completion before any TTS
+      // synthesis begins — this is what made replies feel slow to start.
+      let rest = '';
+      let pending: string | null = null;
+      let sawFirstSentence = false;
+      const flushPending = (isLast: boolean) => {
+        if (pending === null) return;
+        const { cleanText, newWords } = parseNewWordTags(pending);
+        for (const word of newWords) addConversationWord(word);
+        enqueueElevenLabsSpeech(cleanText, { rate: SPEECH_RATE, onSettled: isLast ? resumeListening : undefined });
+        if (!sawFirstSentence) {
+          sawFirstSentence = true;
+          setCallState('speaking');
+          speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
+        }
+      };
+
+      chatCompleteStream(messages, (delta) => {
+        if (requestGeneration !== generationRef.current) return;
+        rest += delta;
+        const { sentences, rest: remainder } = extractCompleteSentences(rest);
+        rest = remainder;
+        for (const sentence of sentences) {
+          flushPending(false);
+          pending = sentence;
+        }
+      })
         .then((reply) => {
           if (requestGeneration !== generationRef.current) return; // call ended/restarted while this was in flight
-          const { cleanText, newWords } = parseNewWordTags(reply);
-          for (const word of newWords) addConversationWord(word);
+          if (rest.trim()) {
+            flushPending(false);
+            pending = rest;
+          }
+          flushPending(true);
+          if (!sawFirstSentence) {
+            // Reply was empty/unspeakable — still need to resume listening.
+            setCallState('speaking');
+            resumeListening();
+          }
+          const { cleanText } = parseNewWordTags(reply);
           setTranscriptLog((prev) => [...prev, { role: 'assistant', text: cleanText }]);
           const assistantMessage: ChatMessage = { role: 'assistant', content: reply };
           recentTurnsRef.current = [...recentTurnsRef.current, assistantMessage].slice(-RECENT_TURNS_LIMIT);
           turnsSinceSummaryRef.current = [...turnsSinceSummaryRef.current, assistantMessage];
           triggerMemoryUpdateIfDue();
-          setCallState('speaking');
-          speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
-          speakWithElevenLabs(cleanText, { rate: SPEECH_RATE, onSettled: resumeListening });
+          // Known words the tutor's reply just used — checked against the
+          // learner's *next* transcript at the top of this function.
+          awaitingEchoRef.current = stateRef.current.learned
+            .map((c) => resolveCharacterDisplay(c, lang).hanzi)
+            .filter((hanzi) => cleanText.includes(hanzi));
         })
         .catch(() => {
           if (requestGeneration !== generationRef.current) return;
           setCallState('speaking');
           speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
-          speakWithElevenLabs(ERROR_FALLBACK_REPLY, { rate: SPEECH_RATE, onSettled: resumeListening });
+          enqueueElevenLabsSpeech(ERROR_FALLBACK_REPLY, { rate: SPEECH_RATE, onSettled: resumeListening });
         });
     },
-    [addConversationWord, clearSpeakingTimeout, flushMemoryUpdate, triggerMemoryUpdateIfDue]
+    [addConversationWord, clearSpeakingTimeout, flushMemoryUpdate, triggerMemoryUpdateIfDue, updatePronunciation]
   );
 
   const { start, stop, error, listening } = useSpeechRecognition(handleTranscript);
   useEffect(() => {
-    startRef.current = start;
+    startRef.current = () =>
+      start({ lang: SPEECH_LOCALE[languageRef.current], contextualStrings: contextualStringsFor(stateRef.current.learned, languageRef.current) });
     stopRef.current = stop;
-  }, [start, stop]);
+  }, [start, stop, contextualStringsFor]);
 
   // Errors from the recognizer. Transient ones (a pause, an iOS audio-session
   // interruption like a phone call) get an automatic retry. Anything else
@@ -241,17 +408,34 @@ export function useTalkSession() {
     }
   }, [listening, callState]);
 
-  const startCall = useCallback(() => {
-    callActiveRef.current = true;
-    busyRef.current = false;
-    generationRef.current += 1;
-    exchangeCountRef.current = 0;
-    recentTurnsRef.current = [];
-    turnsSinceSummaryRef.current = [];
-    setTranscriptLog([]);
-    setCallState('listening');
-    start();
-  }, [start]);
+  const startCall = useCallback(
+    async (durationMin: number) => {
+      const lang = language;
+      durationMinRef.current = durationMin;
+      callStartedAtRef.current = Date.now();
+      contextSignalsRef.current = ''; // reset in case a prior call's fetch is still pending
+      getContextSignals().then((signals) => {
+        contextSignalsRef.current = signals;
+      });
+      setPlanning(true);
+      const plan = await planSession(durationMin, state.learned, state.talkMemory, state.sessionPlans, lang, state.difficulty);
+      setPlanning(false);
+      currentPlanRef.current = plan;
+      setCurrentPlan(plan);
+
+      callActiveRef.current = true;
+      busyRef.current = false;
+      generationRef.current += 1;
+      exchangeCountRef.current = 0;
+      recentTurnsRef.current = [];
+      turnsSinceSummaryRef.current = [];
+      awaitingEchoRef.current = [];
+      setTranscriptLog([]);
+      setCallState('listening');
+      start({ lang: SPEECH_LOCALE[lang], contextualStrings: contextualStringsFor(state.learned, lang) });
+    },
+    [language, state.learned, state.talkMemory, state.sessionPlans, state.difficulty, start, contextualStringsFor]
+  );
 
   const endCall = useCallback(() => {
     callActiveRef.current = false;
@@ -261,8 +445,21 @@ export function useTalkSession() {
     stop();
     stopElevenLabsSpeech();
     flushMemoryUpdate();
+    if (currentPlanRef.current && durationMinRef.current > 0) {
+      addSessionPlan({
+        date: new Date().toISOString(),
+        durationMin: durationMinRef.current,
+        focusWords: currentPlanRef.current.focusWords,
+        topics: currentPlanRef.current.topics,
+        goal: currentPlanRef.current.goal,
+        outcome: stateRef.current.talkMemory,
+      });
+    }
+    currentPlanRef.current = null;
+    setCurrentPlan(null);
+    durationMinRef.current = 0;
     setCallState('idle');
-  }, [stop, clearSpeakingTimeout, flushMemoryUpdate]);
+  }, [stop, clearSpeakingTimeout, flushMemoryUpdate, addSessionPlan]);
 
-  return { callState, transcriptLog, startCall, endCall, error: error?.message ?? null };
+  return { callState, transcriptLog, planning, currentPlan, startCall, endCall, error: error?.message ?? null };
 }

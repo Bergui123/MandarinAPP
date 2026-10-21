@@ -30,7 +30,7 @@ export function useSpeechRecognition(onTranscript: (text: string) => void) {
     setError({ code: event.error, message: event.message || event.error });
   });
 
-  const start = useCallback(() => {
+  const start = useCallback((options: { lang: string; contextualStrings?: string[] }) => {
     setError(null);
     ExpoSpeechRecognitionModule.requestPermissionsAsync().then((result) => {
       if (!result.granted) {
@@ -49,13 +49,17 @@ export function useSpeechRecognition(onTranscript: (text: string) => void) {
       // accurate for Mandarin on real hardware (on-device misheard a plain "你好"
       // entirely). Accuracy matters more here than the offline/privacy upside.
       ExpoSpeechRecognitionModule.start({
-        lang: 'zh-CN',
+        lang: options.lang,
         continuous: true,
         interimResults: true,
         // "confirmation" tells iOS this is a short conversational utterance, not
         // long-form dictation — the default hint waits noticeably longer for a
         // pause before finalizing, which is what read as "delay to understand".
         iosTaskHint: TaskHintIOS.confirmation,
+        // Biases recognition toward the learner's known vocabulary (and the
+        // goodbye phrases) — the real lever for cutting mis-hearings, since
+        // taskHint only affects finalize timing, not word choice.
+        contextualStrings: options.contextualStrings,
       });
     });
   }, []);

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Platform, Pressable, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { LanguageSwitcher } from '@/components/language-switcher';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
@@ -23,7 +24,7 @@ function shuffled(ids: number[]): number[] {
 }
 
 export default function QuizScreen() {
-  const { state, ready, markMissed } = useAppState();
+  const { state, language, setLanguage, ready, markMissed } = useAppState();
   const [sessionIds, setSessionIds] = useState<number[] | null>(null);
   const [index, setIndex] = useState(0);
   const [flipped, setFlipped] = useState(false);
@@ -58,6 +59,7 @@ export default function QuizScreen() {
       <ThemedView style={styles.container}>
         <SafeAreaView style={styles.safeArea}>
           <ThemedText type="subtitle">Quiz</ThemedText>
+          <LanguageSwitcher language={language} onChange={setLanguage} />
           <ThemedText themeColor="textSecondary">
             Learn your first character on the Practice tab, then come back to quiz yourself.
           </ThemedText>
@@ -85,11 +87,12 @@ export default function QuizScreen() {
   }
 
   const learnedEntry = state.learned.find((c) => c.id === sessionIds[index])!;
-  const char = resolveCharacterDisplay(learnedEntry);
+  const char = resolveCharacterDisplay(learnedEntry, language);
 
   return (
     <ThemedView style={styles.container}>
       <SafeAreaView style={styles.safeArea}>
+        <LanguageSwitcher language={language} onChange={setLanguage} />
         <ThemedText type="small" themeColor="textSecondary">
           Card {index + 1} of {sessionIds.length}
         </ThemedText>
