@@ -49,7 +49,13 @@ export async function chatComplete(messages: ChatMessage[], options?: { json?: b
 // reply wait for the entire response before any TTS synthesis even starts.
 export async function chatCompleteStream(messages: ChatMessage[], onToken: (delta: string) => void): Promise<string> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  // Re-armed on every chunk (see resetTimeout below) so this guards the whole
+  // stream, not just the initial connection — a mid-stream stall now aborts too.
+  let timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const resetTimeout = () => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  };
 
   // The global fetch's response.body isn't a real streamable ReadableStream in
   // React Native — expo/fetch's is (see Expo's "Streaming fetch" docs), and is
@@ -66,15 +72,15 @@ export async function chatCompleteStream(messages: ChatMessage[], onToken: (delt
       signal: controller.signal,
     });
   } catch (err) {
+    clearTimeout(timeout);
     if (err instanceof Error && err.name === 'AbortError') {
       throw new Error(`DeepSeek request timed out after ${TIMEOUT_MS}ms`);
     }
     throw err;
-  } finally {
-    clearTimeout(timeout);
   }
 
   if (!response.ok || !response.body) {
+    clearTimeout(timeout);
     const body = await response.text().catch(() => '');
     throw new Error(`DeepSeek request failed (${response.status}): ${body}`);
   }
@@ -84,29 +90,39 @@ export async function chatCompleteStream(messages: ChatMessage[], onToken: (delt
   let buffer = '';
   let full = '';
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      resetTimeout();
+      buffer += decoder.decode(value, { stream: true });
 
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? ''; // keep the last (possibly incomplete) line for next read
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) continue;
-      const payload = trimmed.slice('data:'.length).trim();
-      if (payload === '[DONE]') continue;
-      try {
-        const parsed = JSON.parse(payload);
-        const delta: string | undefined = parsed.choices?.[0]?.delta?.content;
-        if (delta) {
-          full += delta;
-          onToken(delta);
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? ''; // keep the last (possibly incomplete) line for next read
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice('data:'.length).trim();
+        if (payload === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(payload);
+          const delta: string | undefined = parsed.choices?.[0]?.delta?.content;
+          if (delta) {
+            full += delta;
+            onToken(delta);
+          }
+        } catch {
+          // partial/malformed SSE chunk — skip it, the stream continues
         }
-      } catch {
-        // partial/malformed SSE chunk — skip it, the stream continues
       }
     }
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(`DeepSeek request timed out after ${TIMEOUT_MS}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
 
   return full;

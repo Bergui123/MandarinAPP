@@ -63,11 +63,20 @@ function useAppStateValue() {
   const addSpeak = useCallback((charId: number) => persist((prev) => incrementCount(prev, charId, 'speak')), [persist]);
   const markMissed = useCallback((charId: number) => persist((prev) => resetToNew(prev, charId)), [persist]);
 
-  const addConversationWordAction = useCallback(
-    (word: { hanzi: string; pinyin: string; meaning: string }) =>
-      persist((prev) => addConversationWord(prev, word, full.activeLanguage)),
-    [persist, full.activeLanguage]
-  );
+  // Not built on the generic persist() helper: addConversationWord needs the
+  // active *language* (to know which vocab dataset to check), and only the
+  // freshest `prev.activeLanguage` inside this setFull updater is guaranteed
+  // current — the outer `full.activeLanguage` closure can be one render stale.
+  const addConversationWordAction = useCallback((word: { hanzi: string; pinyin: string; meaning: string }) => {
+    setFull((prev) => {
+      const lang = prev.activeLanguage;
+      const next = { ...prev, [lang]: addConversationWord(prev[lang], word, lang) };
+      AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch((err) =>
+        console.warn('Failed to save app state', err)
+      );
+      return next;
+    });
+  }, []);
   const updateNotesAction = useCallback(
     (id: number, notes: string) => persist((prev) => updateNotes(prev, id, notes)),
     [persist]

@@ -4,7 +4,7 @@ import { useAppState } from '@/hooks/use-app-state';
 import { useSpeechRecognition } from '@/hooks/use-speech-recognition';
 import { getContextSignals } from '@/lib/context-signals';
 import { ChatMessage, chatComplete, chatCompleteStream } from '@/lib/deepseek';
-import { enqueueElevenLabsSpeech, stopElevenLabsSpeech } from '@/lib/elevenlabs-speech';
+import { enqueueElevenLabsSpeech, speakWithElevenLabs, stopElevenLabsSpeech } from '@/lib/elevenlabs-speech';
 import { SPEECH_LOCALE } from '@/lib/language-locale';
 import { Difficulty, Language, LearnedChar, resolveCharacterDisplay, SessionPlan } from '@/lib/progress';
 
@@ -68,7 +68,14 @@ export function extractCompleteSentences(buffer: string): { sentences: string[];
     let match: RegExpExecArray | null;
     let cut = -1;
     while ((match = enderRegex.exec(rest))) {
+      const char = match[0];
       const endIdx = match.index + 1;
+      // '.' may be the start of an ellipsis ("...") still arriving token-by-token.
+      // Skip past a dot that's followed by another dot, and hold off cutting on
+      // a lone trailing dot until more text confirms it isn't one — otherwise an
+      // ellipsis gets sliced into several near-empty, stuttery TTS fragments.
+      if (char === '.' && rest[endIdx] === '.') continue;
+      if (char === '.' && endIdx === rest.length) break;
       const prefix = rest.slice(0, endIdx);
       const openCount = (prefix.match(/⟦/g) ?? []).length;
       const closeCount = (prefix.match(/⟧/g) ?? []).length;
@@ -203,24 +210,36 @@ export function useTalkSession() {
   const stopRef = useRef<() => void>(() => {});
 
   const exchangeCountRef = useRef(0);
-  const runMemoryUpdate = useCallback(() => {
-    const turns = turnsSinceSummaryRef.current;
-    if (turns.length === 0) return;
-    turnsSinceSummaryRef.current = [];
-    const lang = languageRef.current;
-    const touched = findTouchedHanzi(turns, stateRef.current.learned, lang);
-    summarizeAndUpdateMemory(turns, stateRef.current.talkMemory, touched, currentPlanRef.current).then(
-      ({ memory, notes, plan }) => {
-        updateTalkMemory(memory);
-        for (const note of notes) {
-          const entry = stateRef.current.learned.find((c) => resolveCharacterDisplay(c, lang).hanzi === note.hanzi);
-          if (entry) updateNotes(entry.id, note.note);
-        }
-        currentPlanRef.current = plan;
-        setCurrentPlan(plan);
+  // onComplete receives the just-resolved (or, if there was nothing new to
+  // summarize, the current) memory string — callers that need to persist
+  // something derived from memory (endCall's session-plan outcome) must wait
+  // for this instead of reading stateRef.current.talkMemory synchronously,
+  // since updateTalkMemory above hasn't landed in state yet at that point.
+  const runMemoryUpdate = useCallback(
+    (onComplete?: (memory: string) => void) => {
+      const turns = turnsSinceSummaryRef.current;
+      if (turns.length === 0) {
+        onComplete?.(stateRef.current.talkMemory);
+        return;
       }
-    );
-  }, [updateNotes, updateTalkMemory]);
+      turnsSinceSummaryRef.current = [];
+      const lang = languageRef.current;
+      const touched = findTouchedHanzi(turns, stateRef.current.learned, lang);
+      summarizeAndUpdateMemory(turns, stateRef.current.talkMemory, touched, currentPlanRef.current).then(
+        ({ memory, notes, plan }) => {
+          updateTalkMemory(memory);
+          for (const note of notes) {
+            const entry = stateRef.current.learned.find((c) => resolveCharacterDisplay(c, lang).hanzi === note.hanzi);
+            if (entry) updateNotes(entry.id, note.note);
+          }
+          currentPlanRef.current = plan;
+          setCurrentPlan(plan);
+          onComplete?.(memory);
+        }
+      );
+    },
+    [updateNotes, updateTalkMemory]
+  );
   const triggerMemoryUpdateIfDue = useCallback(() => {
     exchangeCountRef.current += 1;
     if (exchangeCountRef.current >= EXCHANGE_THRESHOLD) {
@@ -228,10 +247,13 @@ export function useTalkSession() {
       runMemoryUpdate();
     }
   }, [runMemoryUpdate]);
-  const flushMemoryUpdate = useCallback(() => {
-    exchangeCountRef.current = 0;
-    runMemoryUpdate();
-  }, [runMemoryUpdate]);
+  const flushMemoryUpdate = useCallback(
+    (onComplete?: (memory: string) => void) => {
+      exchangeCountRef.current = 0;
+      runMemoryUpdate(onComplete);
+    },
+    [runMemoryUpdate]
+  );
 
   const speakingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clearSpeakingTimeout = useCallback(() => {
@@ -259,7 +281,7 @@ export function useTalkSession() {
         stopRef.current();
         flushMemoryUpdate();
         setCallState('idle');
-        enqueueElevenLabsSpeech(GOODBYE_REPLY[lang], { rate: SPEECH_RATE });
+        speakWithElevenLabs(GOODBYE_REPLY[lang], { rate: SPEECH_RATE });
         return;
       }
 
@@ -309,22 +331,36 @@ export function useTalkSession() {
         startRef.current();
       };
 
-      // Streams the reply so each sentence can start speaking as soon as it's
+      // Streams the reply so each sentence starts speaking as soon as it's
       // complete, instead of waiting for the full completion before any TTS
-      // synthesis begins — this is what made replies feel slow to start.
+      // synthesis begins. pendingPlaybacks + streamDone together track when
+      // every enqueued sentence has actually finished playing AND no more text
+      // is coming, so resumeListening fires exactly once, however many
+      // sentences the reply turned out to have.
       let rest = '';
-      let pending: string | null = null;
       let sawFirstSentence = false;
-      const flushPending = (isLast: boolean) => {
-        if (pending === null) return;
-        const { cleanText, newWords } = parseNewWordTags(pending);
+      let pendingPlaybacks = 0;
+      let streamDone = false;
+      const maybeResume = () => {
+        if (streamDone && pendingPlaybacks === 0) resumeListening();
+      };
+      const speakSentence = (text: string) => {
+        const { cleanText, newWords } = parseNewWordTags(text);
         for (const word of newWords) addConversationWord(word);
-        enqueueElevenLabsSpeech(cleanText, { rate: SPEECH_RATE, onSettled: isLast ? resumeListening : undefined });
         if (!sawFirstSentence) {
           sawFirstSentence = true;
           setCallState('speaking');
-          speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
         }
+        pendingPlaybacks += 1;
+        clearSpeakingTimeout();
+        speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
+        enqueueElevenLabsSpeech(cleanText, {
+          rate: SPEECH_RATE,
+          onSettled: () => {
+            pendingPlaybacks -= 1;
+            maybeResume();
+          },
+        });
       };
 
       chatCompleteStream(messages, (delta) => {
@@ -332,22 +368,18 @@ export function useTalkSession() {
         rest += delta;
         const { sentences, rest: remainder } = extractCompleteSentences(rest);
         rest = remainder;
-        for (const sentence of sentences) {
-          flushPending(false);
-          pending = sentence;
-        }
+        for (const sentence of sentences) speakSentence(sentence);
       })
         .then((reply) => {
           if (requestGeneration !== generationRef.current) return; // call ended/restarted while this was in flight
-          if (rest.trim()) {
-            flushPending(false);
-            pending = rest;
-          }
-          flushPending(true);
+          if (rest.trim()) speakSentence(rest);
+          streamDone = true;
           if (!sawFirstSentence) {
             // Reply was empty/unspeakable — still need to resume listening.
             setCallState('speaking');
             resumeListening();
+          } else {
+            maybeResume();
           }
           const { cleanText } = parseNewWordTags(reply);
           setTranscriptLog((prev) => [...prev, { role: 'assistant', text: cleanText }]);
@@ -364,8 +396,9 @@ export function useTalkSession() {
         .catch(() => {
           if (requestGeneration !== generationRef.current) return;
           setCallState('speaking');
+          clearSpeakingTimeout();
           speakingTimeoutRef.current = setTimeout(resumeListening, SPEAKING_SAFETY_TIMEOUT_MS);
-          enqueueElevenLabsSpeech(ERROR_FALLBACK_REPLY, { rate: SPEECH_RATE, onSettled: resumeListening });
+          speakWithElevenLabs(ERROR_FALLBACK_REPLY, { rate: SPEECH_RATE, onSettled: resumeListening });
         });
     },
     [addConversationWord, clearSpeakingTimeout, flushMemoryUpdate, triggerMemoryUpdateIfDue, updatePronunciation]
@@ -413,19 +446,26 @@ export function useTalkSession() {
       const lang = language;
       durationMinRef.current = durationMin;
       callStartedAtRef.current = Date.now();
-      contextSignalsRef.current = ''; // reset in case a prior call's fetch is still pending
+      stopElevenLabsSpeech(); // clear any leftover audio from a just-ended previous call
+      // Bump immediately (not after planning) so this call has its own identity
+      // right away: a stale previous call's in-flight work is invalidated now,
+      // and myGeneration below lets this call detect being cancelled (endCall,
+      // or another startCall) while planSession is still in flight.
+      generationRef.current += 1;
+      const myGeneration = generationRef.current;
+      contextSignalsRef.current = '';
       getContextSignals().then((signals) => {
-        contextSignalsRef.current = signals;
+        if (generationRef.current === myGeneration) contextSignalsRef.current = signals;
       });
       setPlanning(true);
       const plan = await planSession(durationMin, state.learned, state.talkMemory, state.sessionPlans, lang, state.difficulty);
       setPlanning(false);
+      if (generationRef.current !== myGeneration) return; // ended/restarted while planning was in flight
       currentPlanRef.current = plan;
       setCurrentPlan(plan);
 
       callActiveRef.current = true;
       busyRef.current = false;
-      generationRef.current += 1;
       exchangeCountRef.current = 0;
       recentTurnsRef.current = [];
       turnsSinceSummaryRef.current = [];
@@ -444,17 +484,20 @@ export function useTalkSession() {
     clearSpeakingTimeout();
     stop();
     stopElevenLabsSpeech();
-    flushMemoryUpdate();
-    if (currentPlanRef.current && durationMinRef.current > 0) {
-      addSessionPlan({
-        date: new Date().toISOString(),
-        durationMin: durationMinRef.current,
-        focusWords: currentPlanRef.current.focusWords,
-        topics: currentPlanRef.current.topics,
-        goal: currentPlanRef.current.goal,
-        outcome: stateRef.current.talkMemory,
-      });
-    }
+    const plan = currentPlanRef.current;
+    const duration = durationMinRef.current;
+    flushMemoryUpdate((memory) => {
+      if (plan && duration > 0) {
+        addSessionPlan({
+          date: new Date().toISOString(),
+          durationMin: duration,
+          focusWords: plan.focusWords,
+          topics: plan.topics,
+          goal: plan.goal,
+          outcome: memory,
+        });
+      }
+    });
     currentPlanRef.current = null;
     setCurrentPlan(null);
     durationMinRef.current = 0;

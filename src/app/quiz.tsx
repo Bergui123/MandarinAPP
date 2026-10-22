@@ -28,11 +28,17 @@ export default function QuizScreen() {
   const [sessionIds, setSessionIds] = useState<number[] | null>(null);
   const [index, setIndex] = useState(0);
   const [flipped, setFlipped] = useState(false);
+  const [sessionLanguage, setSessionLanguage] = useState(language);
 
-  // One-time init once the persisted state has loaded (not an effect: see
+  // Init once the persisted state has loaded, and re-init on a language switch
+  // mid-session — zh/fr ids overlap, so a stale session built for the other
+  // language would resolve to the wrong (or a missing) word (not an effect:
   // https://react.dev/learn/you-might-not-need-an-effect#adjusting-state-based-on-a-prop-or-other-state-change).
-  if (ready && sessionIds === null) {
+  if (ready && (sessionIds === null || sessionLanguage !== language)) {
+    setSessionLanguage(language);
     setSessionIds(shuffled(state.learned.map((c) => c.id)));
+    setIndex(0);
+    setFlipped(false);
   }
 
   function startNewSession() {
